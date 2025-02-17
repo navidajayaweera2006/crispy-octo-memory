@@ -1,0 +1,288 @@
+#include <webots/Robot.hpp>
+#include <webots/Motor.hpp>
+#include <webots/Camera.hpp>
+#include <webots/DistanceSensor.hpp>
+#include <webots/Gripper.hpp>
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <string>
+
+#define TIME_STEP 64
+#define MAX_SPEED 6.28
+
+using namespace webots;
+
+// Structure to hold color thresholds
+struct ColorThreshold {
+    std::string name;
+    int minR, maxR;
+    int minG, maxG;
+    int minB, maxB;
+};
+
+enum State {
+    SCAN_FOR_BALLS,
+    MOVE_TO_BALL,
+    GRAB_BALL,
+    SCAN_FOR_WALL,
+    MOVE_TO_WALL,
+    PLACE_BALL,
+    BACK_UP
+};
+
+class ColorSortingRobot {
+private:
+    Robot *robot;
+    Motor *leftMotor, *rightMotor;
+    Camera *camera;
+    Gripper *gripper;
+    DistanceSensor *distanceSensor;
+    State currentState;
+    int ballX;
+    int wallX;
+    double rotationAngle;
+    std::string currentBallColor;
+    std::vector<ColorThreshold> colorThresholds;
+
+public:
+    ColorSortingRobot() {
+        // Initialize robot and devices
+        robot = new Robot();
+        
+        // Initialize motors
+        leftMotor = robot->getMotor("left wheel motor");
+        rightMotor = robot->getMotor("right wheel motor");
+        leftMotor->setPosition(INFINITY);
+        rightMotor->setPosition(INFINITY);
+        leftMotor->setVelocity(0);
+        rightMotor->setVelocity(0);
+        
+        // Initialize camera
+        camera = robot->getCamera("camera");
+        camera->enable(TIME_STEP);
+        
+        // Initialize gripper
+        gripper = robot->getGripper("gripper");
+        
+        // Initialize distance sensor
+        distanceSensor = robot->getDistanceSensor("distance sensor");
+        distanceSensor->enable(TIME_STEP);
+        
+        // Initialize state
+        currentState = SCAN_FOR_BALLS;
+        ballX = -1;
+        wallX = -1;
+        rotationAngle = 0;
+        currentBallColor = "";
+        
+        // Define color thresholds
+        setupColorThresholds();
+    }
+
+    void setupColorThresholds() {
+        colorThresholds = {
+            {"red",   {200, 255, 0, 50,  0, 50}},
+            {"green", {0, 50,  200, 255, 0, 50}},
+            {"pink",  {255, 255, 150, 200, 200, 255}},
+            {"yellow", {200, 255, 200, 255, 0, 50}}
+        };
+    }
+
+    void rotate(double speed) {
+        leftMotor->setVelocity(speed);
+        rightMotor->setVelocity(-speed);
+        rotationAngle += speed * TIME_STEP / 1000.0;
+    }
+
+    void moveForward(double speed) {
+        leftMotor->setVelocity(speed);
+        rightMotor->setVelocity(speed);
+    }
+
+    void stop() {
+        leftMotor->setVelocity(0);
+        rightMotor->setVelocity(0);
+    }
+
+    std::string detectColor(int r, int g, int b) {
+        for (const auto& color : colorThresholds) {
+            if (r >= color.minR && r <= color.maxR &&
+                g >= color.minG && g <= color.maxG &&
+                b >= color.minB && b <= color.maxB) {
+                return color.name;
+            }
+        }
+        return "unknown";
+    }
+
+    bool detectObject(std::string targetColor, bool isWall) {
+        const unsigned char *image = camera->getImage();
+        int width = camera->getWidth();
+        int height = camera->getHeight();
+        int maxSize = 0;
+        int objectX = -1;
+
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                int r = Camera::imageGetRed(image, width, x, y);
+                int g = Camera::imageGetGreen(image, width, x, y);
+                int b = Camera::imageGetBlue(image, width, x, y);
+                
+                std::string detectedColor = detectColor(r, g, b);
+                
+                if (detectedColor == targetColor) {
+                    int size = 1;
+                    while (x + size < width) {
+                        int nextR = Camera::imageGetRed(image, width, x + size, y);
+                        int nextG = Camera::imageGetGreen(image, width, x + size, y);
+                        int nextB = Camera::imageGetBlue(image, width, x + size, y);
+                        if (detectColor(nextR, nextG, nextB) != targetColor) break;
+                        size++;
+                    }
+                    
+                    // Walls typically appear larger than balls in the image
+                    if ((isWall && size > maxSize) || (!isWall && size > maxSize && size < width/4)) {
+                        maxSize = size;
+                        objectX = x;
+                    }
+                }
+            }
+        }
+
+        if (isWall) {
+            wallX = objectX;
+        } else {
+            ballX = objectX;
+        }
+        
+        return objectX != -1;
+    }
+
+    void run() {
+        bool hasCompletedRotation = false;
+        double startTime = robot->getTime();
+
+        while (robot->step(TIME_STEP) != -1) {
+            switch (currentState) {
+                case SCAN_FOR_BALLS:
+                    if (!hasCompletedRotation) {
+                        rotate(MAX_SPEED * 0.3);
+                        
+                        // Check for all possible ball colors
+                        for (const auto& color : colorThresholds) {
+                            if (detectObject(color.name, false)) {
+                                currentBallColor = color.name;
+                                hasCompletedRotation = true;
+                                stop();
+                                std::cout << "Found " << currentBallColor << " ball!" << std::endl;
+                                currentState = MOVE_TO_BALL;
+                                break;
+                            }
+                        }
+
+                        // Check if we've completed a full rotation
+                        if (robot->getTime() - startTime > 10.0) {  // Approximately time for full rotation
+                            hasCompletedRotation = true;
+                            stop();
+                            startTime = robot->getTime();  // Reset timer
+                        }
+                    } else {
+                        hasCompletedRotation = false;  // Reset for next scan
+                        startTime = robot->getTime();
+                    }
+                    break;
+
+                case MOVE_TO_BALL:
+                    if (ballX != -1) {
+                        int center = camera->getWidth() / 2;
+                        if (ballX < center - 5) {
+                            rotate(-MAX_SPEED * 0.2);
+                        } else if (ballX > center + 5) {
+                            rotate(MAX_SPEED * 0.2);
+                        } else {
+                            moveForward(MAX_SPEED * 0.5);
+                        }
+                        
+                        // Check if we're close enough to grab
+                        if (distanceSensor->getValue() < 100) {  // Adjust threshold as needed
+                            stop();
+                            currentState = GRAB_BALL;
+                        }
+                    }
+                    break;
+
+                case GRAB_BALL:
+                    gripper->grip();
+                    std::cout << "Grabbed " << currentBallColor << " ball" << std::endl;
+                    hasCompletedRotation = false;
+                    currentState = SCAN_FOR_WALL;
+                    startTime = robot->getTime();
+                    break;
+
+                case SCAN_FOR_WALL:
+                    if (!hasCompletedRotation) {
+                        rotate(MAX_SPEED * 0.3);
+                        if (detectObject(currentBallColor, true)) {
+                            hasCompletedRotation = true;
+                            stop();
+                            std::cout << "Found " << currentBallColor << " wall!" << std::endl;
+                            currentState = MOVE_TO_WALL;
+                        }
+                        
+                        if (robot->getTime() - startTime > 10.0) {
+                            hasCompletedRotation = true;
+                            stop();
+                            startTime = robot->getTime();
+                        }
+                    }
+                    break;
+
+                case MOVE_TO_WALL:
+                    if (wallX != -1) {
+                        int center = camera->getWidth() / 2;
+                        if (wallX < center - 5) {
+                            rotate(-MAX_SPEED * 0.2);
+                        } else if (wallX > center + 5) {
+                            rotate(MAX_SPEED * 0.2);
+                        } else {
+                            moveForward(MAX_SPEED * 0.5);
+                        }
+                        
+                        if (distanceSensor->getValue() < 50) {  // Closer threshold for wall
+                            stop();
+                            currentState = PLACE_BALL;
+                        }
+                    }
+                    break;
+
+                case PLACE_BALL:
+                    gripper->release();
+                    std::cout << "Placed " << currentBallColor << " ball at matching wall" << std::endl;
+                    currentState = BACK_UP;
+                    break;
+
+                case BACK_UP:
+                    // Back up for 2 seconds
+                    moveForward(-MAX_SPEED * 0.3);
+                    robot->step(2000);  // 2 seconds
+                    stop();
+                    
+                    // Reset for next ball
+                    ballX = -1;
+                    wallX = -1;
+                    currentBallColor = "";
+                    hasCompletedRotation = false;
+                    currentState = SCAN_FOR_BALLS;
+                    startTime = robot->getTime();
+                    break;
+            }
+        }
+    }
+};
+
+int main() {
+    ColorSortingRobot robot;
+    robot.run();
+    return 0;
+}
